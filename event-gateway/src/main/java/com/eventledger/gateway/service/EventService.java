@@ -3,10 +3,14 @@ package com.eventledger.gateway.service;
 import com.eventledger.gateway.api.EventResponse;
 import com.eventledger.gateway.api.SubmitEventRequest;
 import com.eventledger.gateway.api.SubmitOutcome;
+import com.eventledger.gateway.client.AccountServiceClient;
+import com.eventledger.gateway.client.AccountServiceUnavailableException;
+import com.eventledger.gateway.client.AccountTransactionRequest;
 import com.eventledger.gateway.domain.EventRecord;
 import com.eventledger.gateway.domain.EventStatus;
 import com.eventledger.gateway.repository.EventRecordRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -22,13 +26,21 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Owns the gateway's local event store. Submission is idempotent on
- * {@code eventId}; reads are served entirely from local data so they keep
- * working even when the Account Service is unavailable.
+ * Owns the gateway's local event store and forwards transactions to the Account
+ * Service.
  *
- * <p>At this stage the event is stored as {@link EventStatus#PENDING}; the
- * resilient call that forwards it to the Account Service and confirms it is
- * wired in a later step.
+ * <p>The event is always persisted locally first (as {@link EventStatus#PENDING}),
+ * then forwarded. This ordering is deliberate: if the downstream call fails the
+ * record survives, so reads keep working and the event can be reconciled later.
+ * On a downstream outage the caller gets a 503 (via
+ * {@link AccountServiceUnavailableException}) rather than a hang or a 500.
+ *
+ * <p>Submission is idempotent on {@code eventId}. A re-submitted event that is
+ * still {@code PENDING} (a previous downstream failure) is retried; one already
+ * {@code APPLIED} is a no-op.
+ *
+ * <p>Note: this method is intentionally <em>not</em> wrapped in a single
+ * transaction, so the initial save commits independently of the downstream call.
  */
 @Service
 public class EventService {
@@ -38,20 +50,22 @@ public class EventService {
     private final EventRecordRepository repository;
     private final ObjectMapper objectMapper;
     private final MeterRegistry meterRegistry;
+    private final AccountServiceClient accountServiceClient;
 
     public EventService(EventRecordRepository repository,
                         ObjectMapper objectMapper,
-                        MeterRegistry meterRegistry) {
+                        MeterRegistry meterRegistry,
+                        AccountServiceClient accountServiceClient) {
         this.repository = repository;
         this.objectMapper = objectMapper;
         this.meterRegistry = meterRegistry;
+        this.accountServiceClient = accountServiceClient;
     }
 
-    @Transactional
     public EventResponse submitEvent(SubmitEventRequest request) {
         Optional<EventRecord> existing = repository.findByEventId(request.eventId());
         if (existing.isPresent()) {
-            return duplicate(existing.get());
+            return handleDuplicate(existing.get());
         }
 
         EventRecord record = new EventRecord(
@@ -66,18 +80,22 @@ public class EventService {
                 EventStatus.PENDING
         );
 
+        EventRecord saved;
         try {
-            EventRecord saved = repository.saveAndFlush(record);
-            recordReceived("accepted");
-            log.info("Stored event eventId={} accountId={} type={} amount={} {} status={}",
-                    saved.getEventId(), saved.getAccountId(), saved.getType(),
-                    saved.getAmount(), saved.getCurrency(), saved.getStatus());
-            return EventResponse.of(saved, SubmitOutcome.ACCEPTED);
+            saved = repository.saveAndFlush(record);
         } catch (DataIntegrityViolationException race) {
             // Concurrent duplicate won the unique-constraint race; treat as duplicate.
             EventRecord winner = repository.findByEventId(request.eventId()).orElseThrow(() -> race);
-            return duplicate(winner);
+            return handleDuplicate(winner);
         }
+
+        recordReceived("accepted");
+        log.info("Stored event eventId={} accountId={} type={} amount={} {} status={}",
+                saved.getEventId(), saved.getAccountId(), saved.getType(),
+                saved.getAmount(), saved.getCurrency(), saved.getStatus());
+
+        forwardToAccountService(saved); // may throw AccountServiceUnavailableException -> 503
+        return EventResponse.of(saved, SubmitOutcome.ACCEPTED);
     }
 
     @Transactional(readOnly = true)
@@ -94,11 +112,39 @@ public class EventService {
                 .toList();
     }
 
-    private EventResponse duplicate(EventRecord existing) {
+    private EventResponse handleDuplicate(EventRecord existing) {
         recordReceived("duplicate");
-        log.info("Duplicate event ignored eventId={} accountId={}",
-                existing.getEventId(), existing.getAccountId());
+        log.info("Duplicate event eventId={} accountId={} status={}",
+                existing.getEventId(), existing.getAccountId(), existing.getStatus());
+
+        // A still-pending duplicate is a chance to complete a previously failed forward.
+        if (existing.getStatus() == EventStatus.PENDING) {
+            forwardToAccountService(existing); // may throw -> 503
+        }
         return EventResponse.of(existing, SubmitOutcome.DUPLICATE);
+    }
+
+    /**
+     * Forward the event to the Account Service through the resilient client. On
+     * success the record is promoted to {@code APPLIED}; on a downstream outage
+     * the exception propagates (record stays {@code PENDING}).
+     */
+    private void forwardToAccountService(EventRecord record) {
+        AccountTransactionRequest downstreamRequest = new AccountTransactionRequest(
+                record.getEventId(),
+                record.getType(),
+                record.getAmount(),
+                record.getCurrency(),
+                record.getEventTimestamp(),
+                deserializeMetadata(record.getMetadataJson())
+        );
+
+        accountServiceClient.applyTransaction(record.getAccountId(), downstreamRequest);
+
+        record.setStatus(EventStatus.APPLIED);
+        repository.save(record);
+        log.info("Event applied downstream eventId={} accountId={}",
+                record.getEventId(), record.getAccountId());
     }
 
     private String serializeMetadata(Map<String, Object> metadata) {
@@ -109,6 +155,18 @@ public class EventService {
             return objectMapper.writeValueAsString(metadata);
         } catch (JsonProcessingException e) {
             log.warn("Could not serialize metadata; storing null", e);
+            return null;
+        }
+    }
+
+    private Map<String, Object> deserializeMetadata(String json) {
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {});
+        } catch (JsonProcessingException e) {
+            log.warn("Could not deserialize stored metadata; forwarding without it", e);
             return null;
         }
     }

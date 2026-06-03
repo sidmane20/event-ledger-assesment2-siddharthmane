@@ -1,16 +1,19 @@
 package com.eventledger.gateway.web;
 
 import com.eventledger.gateway.api.ErrorResponse;
+import com.eventledger.gateway.client.AccountServiceUnavailableException;
 import com.eventledger.gateway.service.EventNotFoundException;
 import io.micrometer.tracing.Tracer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.client.HttpClientErrorException;
 
 import java.time.Instant;
 import java.util.List;
@@ -48,6 +51,27 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(EventNotFoundException.class)
     public ResponseEntity<ErrorResponse> handleNotFound(EventNotFoundException ex) {
         return build(HttpStatus.NOT_FOUND, ex.getMessage(), null);
+    }
+
+    /**
+     * Graceful degradation: the Account Service is unreachable or the circuit is
+     * open. Return 503 with a clear message rather than hanging or returning 500.
+     */
+    @ExceptionHandler(AccountServiceUnavailableException.class)
+    public ResponseEntity<ErrorResponse> handleDownstreamUnavailable(AccountServiceUnavailableException ex) {
+        log.warn("Returning 503 — {}", ex.getMessage());
+        return build(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage(), null);
+    }
+
+    /**
+     * The Account Service rejected the request with a 4xx. The gateway validates
+     * the same rules, so this is rare; surface the downstream status transparently.
+     */
+    @ExceptionHandler(HttpClientErrorException.class)
+    public ResponseEntity<ErrorResponse> handleDownstreamClientError(HttpClientErrorException ex) {
+        HttpStatusCode status = ex.getStatusCode();
+        return build(HttpStatus.valueOf(status.value()),
+                "Account Service rejected the request: " + ex.getStatusText(), null);
     }
 
     @ExceptionHandler(Exception.class)

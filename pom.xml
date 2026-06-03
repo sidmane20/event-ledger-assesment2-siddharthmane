@@ -20,7 +20,7 @@
 
     <modules>
         <module>account-service</module>
-        <!-- event-gateway added in a later phase -->
+        <module>event-gateway</module>
     </modules>
 
     <properties>

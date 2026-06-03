@@ -1,0 +1,44 @@
+# Starts the full Event Ledger stack: the public gateway and the internal
+# account service, each as an independent process with its own in-memory H2.
+#
+#   docker compose up --build
+#
+# Gateway:         http://localhost:8080   (POST /events, GET /events/...)
+# Account Service: http://localhost:8081   (internal; exposed here for inspection)
+
+services:
+  account-service:
+    build:
+      context: .
+      dockerfile: account-service/Dockerfile
+    image: event-ledger/account-service:1.0.0
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  event-gateway:
+    build:
+      context: .
+      dockerfile: event-gateway/Dockerfile
+    image: event-ledger/event-gateway:1.0.0
+    ports:
+      - "8080:8080"
+    environment:
+      # Reach the account service over the compose network by its service name.
+      ACCOUNT_SERVICE_BASE_URL: http://account-service:8081
+    depends_on:
+      # The gateway degrades gracefully if the account service is down, but for a
+      # clean demo we wait until it is healthy before starting.
+      account-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s

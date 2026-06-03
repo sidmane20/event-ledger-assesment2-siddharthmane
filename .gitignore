@@ -1,0 +1,23 @@
+# Assessment brief — do NOT publish
+ASSESSMENT.md
+
+# Build output
+target/
+build/
+!**/src/**/target/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# OS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Maven wrapper noise (keep the wrapper jar if added later)
